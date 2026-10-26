@@ -1,0 +1,21 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish the APK as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/Music2NES.apk \
+            --title "Music2NES $GITHUB_REF_NAME" \
+            --notes "Download **Music2NES.apk** below and open it on your Android phone (allow installs from unknown sources). Requires Android 5.0+."

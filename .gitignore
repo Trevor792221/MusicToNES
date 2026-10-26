@@ -1,0 +1,5 @@
+build/
+/Music2NES.apk
+*.keystore
+*.nes
+*.idsig

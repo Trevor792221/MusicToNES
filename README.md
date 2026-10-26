@@ -42,3 +42,7 @@ python3 tools/build.py song.mp3 song.nes 512    # or 1024 for a 1 MB ROM
 ```
 
 `tools/emu.py` is a py65-based test that checks the ROM's sample timing, pause and resume.
+
+## Releasing
+
+Bump `VERSION`, rebuild, copy `Music2NES.apk` into `dist/` and push to `main`. The Release workflow publishes it as `v<VERSION>`, and the download button always points at the latest release.

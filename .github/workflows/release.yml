@@ -1,8 +1,12 @@
 name: Release
 
+# Publishes dist/Music2NES.apk as a GitHub release tagged v<VERSION>
+# whenever the APK or VERSION changes on main (or when run by hand).
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths: ["dist/Music2NES.apk", "VERSION"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,6 +20,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/Music2NES.apk \
-            --title "Music2NES $GITHUB_REF_NAME" \
-            --notes "Download **Music2NES.apk** below and open it on your Android phone (allow installs from unknown sources). Requires Android 5.0+."
+          tag="v$(tr -d '[:space:]' < VERSION)"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag exists; replacing its APK"
+            gh release upload "$tag" dist/Music2NES.apk --clobber
+          else
+            gh release create "$tag" dist/Music2NES.apk \
+              --target "$GITHUB_SHA" \
+              --title "Music2NES $tag" \
+              --notes "Download **Music2NES.apk** below and open it on your Android phone (allow installs from unknown sources). Requires Android 5.0+."
+          fi

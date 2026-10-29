@@ -8,8 +8,15 @@ import java.util.Map;
 
 /**
  * Turns mono PCM into a UxROM (mapper 2) NES ROM that streams the audio
- * through the APU's $4011 DAC. Audio is stored as 4-bit delta codes, two
- * samples per byte, chosen by a Viterbi search. Pure Java, no Android deps.
+ * through the APU's $4011 DAC, with the title, an elapsed/total timer and a
+ * progress bar on screen. Audio is stored as 4-bit delta codes, two samples
+ * per byte, chosen by a Viterbi search. Pure Java, no Android deps.
+ *
+ * Timing: every sample slot runs the same fixed-length "work" block, which
+ * polls vblank and performs a few PPU writes from a precomputed op list, so
+ * the screen updates during vblank without disturbing the sample spacing.
+ * Timer and bar values are precomputed per 256-byte page and stored in the
+ * last two pages of each 16 KB bank.
  */
 public final class RomBuilder {
     public interface Progress {
@@ -32,22 +39,29 @@ public final class RomBuilder {
     static final int[] DELTAS = {-42, -28, -18, -11, -6, -3, -1, 0, 1, 3, 6, 11, 18, 28, 42, 60};
     static final int ZERO = 7;
     static final int ACC0 = 64;
-    static final int PTRLO = 0, PTRHI = 1, BANK = 2, PREV = 3, ACC = 4;
+    static final int PTRLO = 0, PTRHI = 1, BANK = 2, PREV = 3, ACC = 4, OPIDX = 5, YSAVE = 6;
+    static final int OPVAL = 0x0300;            // RAM copy of the PPU op values
+    static final int PAGES_PER_BANK = 62;       // pages 62-63 of each bank hold display tables
+    static final int TABLES = 0xBE00;           // 7 tables x 64 entries, indexed by page in bank
+    static final int N_MIN = 24, N_MAX = 254;   // delay-loop count limits
+    static final int VBLANK_BUDGET = 2200;      // CPU cycles of vblank we allow ourselves to use
+    static final int TIMER_ROW = 21, TIMER_COL = 9, BAR_ROW = 23, BAR_CELLS = 24;
+    static final int BAR_PX = BAR_CELLS * 8;
     public static final int MAX_LINE = 28;
 
     private RomBuilder() {}
 
-    /** Largest song (seconds) that fits, at the lowest sample rate the player supports. */
+    /** Longest song (seconds) that fits, at the lowest sample rate the player supports. */
     public static double maxSeconds(int prgKb) {
-        int c = 5 * 254 + 31;
-        return (prgKb / 16 - 1) * 64 * 512.0 * c / CPU_HZ;
+        int c = 5 * N_MAX + 61 + 15 * 16 + 2;
+        return (prgKb / 16 - 1) * PAGES_PER_BANK * 512.0 * c / CPU_HZ;
     }
 
     public static Result build(short[] pcm, int length, int inRate, String artist, String title,
                                int prgKb, Progress p) {
         int prgBanks = prgKb / 16;
         int audioBanks = prgBanks - 1;
-        int maxPages = audioBanks * 64;
+        int maxPages = audioBanks * PAGES_PER_BANK;
 
         // trim near-silence (below -50 dB of peak) from both ends
         int peak = 0;
@@ -60,25 +74,33 @@ public final class RomBuilder {
         int n = end - start;
         double seconds = (double) n / inRate;
 
-        // cycles per sample: C = 5N+29 (+2 with optional NOP); N in [11, 254]
-        int pickN = -1, pickNop = 0, pickC = 0;
-        search:
-        for (int nn = 11; nn <= 254; nn++) {
-            for (int extra = 0; extra <= 2; extra += 2) {
-                int c = 5 * nn + 29 + extra;
-                long m = (long) Math.floor(n * ((double) CPU_HZ / c) / inRate);
-                if ((m + 511) / 512 <= maxPages) {
-                    pickN = nn; pickNop = extra; pickC = c;
-                    break search;
+        // cycles per sample C = 5N + 61 + 15K (+2 with optional NOP), K = PPU ops per slot.
+        // Pick the smallest C whose audio fits and whose PPU updates fit in vblank.
+        int bestN = -1, bestNop = 0, bestC = Integer.MAX_VALUE;
+        Ops bestOps = null;
+        for (int k = 2; k <= 16; k++) {
+            Ops ops = pack(k);
+            if ((ops.slots + 1) * k > 128) continue;
+            int work = 30 + 15 * k;
+            search:
+            for (int nn = N_MIN; nn <= N_MAX; nn++) {
+                for (int extra = 0; extra <= 2; extra += 2) {
+                    int c = 5 * nn + 61 + 15 * k + extra;
+                    long m = (long) Math.floor(n * ((double) CPU_HZ / c) / inRate);
+                    if ((m + 511) / 512 > maxPages) continue;
+                    if (ops.slots * c + work <= VBLANK_BUDGET && c < bestC) {
+                        bestN = nn; bestNop = extra; bestC = c; bestOps = ops;
+                    }
+                    break search;     // larger C only makes the vblank fit worse
                 }
             }
         }
-        if (pickN < 0) {
+        if (bestOps == null) {
             throw new IllegalArgumentException(String.format(
                     "Song is too long (%.0f s). The %d KB ROM holds at most %.0f s.",
                     seconds, prgKb, maxSeconds(prgKb)));
         }
-        double rate = (double) CPU_HZ / pickC;
+        double rate = (double) CPU_HZ / bestC;
 
         p.update("Resampling", 0f);
         float[] x = resample(pcm, start, n, inRate, rate, p);
@@ -114,14 +136,27 @@ public final class RomBuilder {
 
         int pages = (codes.length + 511) / 512;
         byte[] audio = new byte[audioBanks * 16384];
-        for (int i = 0; i < pages * 256; i++) {
-            int hi = 2 * i < codes.length ? codes[2 * i] : ZERO;
-            int lo = 2 * i + 1 < codes.length ? codes[2 * i + 1] : ZERO;
-            audio[i] = (byte) ((hi << 4) | lo);
+        for (int g = 0; g < pages; g++) {
+            int base = (g / PAGES_PER_BANK) * 16384 + (g % PAGES_PER_BANK) * 256;
+            for (int i = 0; i < 256; i++) {
+                int s = (g * 256 + i) * 2;
+                int hi = s < codes.length ? codes[s] : ZERO;
+                int lo = s + 1 < codes.length ? codes[s + 1] : ZERO;
+                audio[base + i] = (byte) ((hi << 4) | lo);
+            }
         }
-        int endBank = pages / 64, endPage = 0x80 + pages % 64;
+        // per-page display values: MT MO ST SO (timer digits), BLO BA BB (bar head)
+        for (int b = 0; b < audioBanks; b++) {
+            for (int k = 0; k < PAGES_PER_BANK; k++) {
+                int[] v = pageDisplay(Math.min(b * PAGES_PER_BANK + k, pages), pages, rate);
+                for (int t = 0; t < 7; t++) audio[b * 16384 + (TABLES - 0x8000) + 64 * t + k] = (byte) v[t];
+            }
+        }
+        int endBank = pages / PAGES_PER_BANK, endPage = 0x80 + pages % PAGES_PER_BANK;
+        double total = codes.length / rate;
 
-        byte[] fixed = assemble(prgBanks, pickN, pickNop != 0, endBank, endPage, artist, title);
+        byte[] fixed = assemble(prgBanks, bestN, bestNop != 0, bestOps, endBank, endPage,
+                artist, title, clock((int) total));
 
         byte[] rom = new byte[16 + prgBanks * 16384];
         byte[] header = {'N', 'E', 'S', 0x1A, (byte) prgBanks, 0, 0x21, 0};
@@ -129,12 +164,33 @@ public final class RomBuilder {
         System.arraycopy(audio, 0, rom, 16, audio.length);
         System.arraycopy(fixed, 0, rom, 16 + audio.length, fixed.length);
         p.update("Done", 1f);
-        return new Result(rom, rate, codes.length / rate);
+        return new Result(rom, rate, total);
     }
 
     static double tnd(double d) {
         return 159.79 / (22638.0 / Math.max(d, 1e-9) + 100);
     }
+
+    /** "MM:SS" with a leading space instead of a zero for minutes under 10. */
+    static String clock(int secs) {
+        int m = Math.min(99, secs / 60), s = secs % 60;
+        return (m < 10 ? " " + m : "" + m) + ":" + (s < 10 ? "0" : "") + s;
+    }
+
+    static int[] pageDisplay(int g, int pages, double rate) {
+        String c = clock((int) (g * 512L / rate));
+        int px = (int) ((long) g * BAR_PX / pages);
+        int i = px >> 3, f = px & 7;
+        return new int[]{
+            tile(c.charAt(0)), tile(c.charAt(1)), tile(c.charAt(3)), tile(c.charAt(4)),
+            (barAddr() & 0xFF) + i,
+            i == 0 ? T_LCAP : T_FULL,
+            i == BAR_CELLS ? T_RCAP : f == 0 ? T_EMPTY : T_PART1 + f - 1,
+        };
+    }
+
+    static int barAddr() { return 0x2000 + BAR_ROW * 32 + 3; }
+    static int timerAddr() { return 0x2000 + TIMER_ROW * 32 + TIMER_COL; }
 
     // ------------------------------------------------------------ resampler
 
@@ -291,6 +347,35 @@ public final class RomBuilder {
         {0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010}, // (
         {0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000}, // )
     };
+    // progress-bar tiles follow the font: empty, 1-7 px filled, full, left cap, right cap
+    static final int T_EMPTY = CHARSET.length(), T_PART1 = T_EMPTY + 1, T_FULL = T_EMPTY + 8,
+            T_LCAP = T_EMPTY + 9, T_RCAP = T_EMPTY + 10, TILE_COUNT = T_EMPTY + 11;
+
+    static int tile(char ch) {
+        return CHARSET.indexOf(ch);
+    }
+
+    /** CHR data: white text and bar outline on plane 0, green bar fill on plane 1. */
+    static byte[] chrData() {
+        int pages = (TILE_COUNT * 16 + 255) / 256;
+        byte[] chr = new byte[pages * 256];
+        for (int t = 0; t < CHARSET.length(); t++)
+            for (int r = 0; r < 7; r++) chr[t * 16 + r] = (byte) (GLYPHS[t][r] << 2);
+        for (int f = 0; f <= 8; f++) {          // bar cells with f px filled
+            int o = (T_EMPTY + f) * 16;
+            chr[o + 1] = chr[o + 6] = (byte) 0xFF;
+            int fill = (0xFF << (8 - f)) & 0xFF;
+            for (int r = 2; r <= 5; r++) chr[o + 8 + r] = (byte) fill;
+        }
+        int l = T_LCAP * 16, rr = T_RCAP * 16;
+        chr[l + 1] = chr[l + 6] = (byte) 0x03;
+        chr[rr + 1] = chr[rr + 6] = (byte) 0xC0;
+        for (int r = 2; r <= 5; r++) {
+            chr[l + r] = (byte) 0x02;
+            chr[rr + r] = (byte) 0x40;
+        }
+        return chr;
+    }
 
     /** Upper-cases and drops characters the font can't draw. */
     public static String sanitize(String s) {
@@ -319,6 +404,48 @@ public final class RomBuilder {
         return out;
     }
 
+    // ------------------------------------------------------------ PPU op list
+
+    /**
+     * The vblank update as a list of (register offset from $2000, value) writes,
+     * packed K per slot. Slot 0 is the idle slot (writes to read-only $2002, a
+     * no-op). $2006/$2005 pairs never straddle a slot, because each slot's
+     * $2002 read resets the PPU's write latch.
+     */
+    static final class Ops {
+        int k, slots;
+        final int[] reg = new int[256], val = new int[256];
+        final int[] pos = new int[7];   // op index of MT MO ST SO BLO BA BB
+    }
+
+    static Ops pack(int k) {
+        int ta = timerAddr(), ba = barAddr();
+        int[][][] groups = {
+            {{6, ba >> 8, -1}, {6, ba & 0xFF, 4}},
+            {{7, T_LCAP, 5}}, {{7, T_EMPTY, 6}},
+            {{6, ta >> 8, -1}, {6, ta & 0xFF, -1}},
+            {{7, 0, 0}}, {{7, 0, 1}}, {{7, tile(':'), -1}}, {{7, 0, 2}}, {{7, 0, 3}},
+            {{0, 0x00, -1}},
+            {{5, 0, -1}, {5, 0, -1}},
+        };
+        Ops o = new Ops();
+        o.k = k;
+        Arrays.fill(o.reg, 2);
+        int idx = k, used = 0;
+        for (int[][] g : groups) {
+            if (g.length > k - used) { idx += k - used; used = 0; }
+            for (int[] op : g) {
+                o.reg[idx] = op[0];
+                o.val[idx] = op[1];
+                if (op[2] >= 0) o.pos[op[2]] = idx;
+                idx++;
+                if (++used == k) used = 0;
+            }
+        }
+        o.slots = (idx - k + k - 1) / k;
+        return o;
+    }
+
     // ------------------------------------------------------------ 6502 code
 
     static final class Asm {
@@ -334,13 +461,33 @@ public final class RomBuilder {
         void b(int... v) { for (int x : v) buf[len++] = (byte) x; }
         void w(int op, int addr) { b(op, addr & 0xFF, addr >> 8); }
         void w(int op, String target) { b(op); fixes.add(new Object[]{"abs", len, target}); b(0, 0); }
-        void br(int op, String target) { b(op); fixes.add(new Object[]{"rel", len, target}); b(0); }
+        void w(int op, String target, int offset) {
+            b(op); fixes.add(new Object[]{"abs", len, target, offset}); b(0, 0);
+        }
+        final List<int[]> branches = new ArrayList<>();   // {operand offset}
+        void br(int op, String target) {
+            b(op); branches.add(new int[]{len}); fixes.add(new Object[]{"rel", len, target}); b(0);
+        }
+
+        /** True if any taken branch between the two labels lands on another page (+1 cycle). */
+        boolean crossesPage(String from, String to) {
+            int lo = labels.get(from), hi = labels.get(to);
+            for (int[] br : branches) {
+                int next = org + br[0] + 1;
+                if (next <= lo || next > hi) continue;
+                int target = next + buf[br[0]];
+                if ((target >> 8) != (next >> 8)) return true;
+            }
+            return false;
+        }
+        void page() { while ((pc() & 0xFF) != 0) b(0); }
 
         void resolve() {
             for (Object[] f : fixes) {
                 int at = (Integer) f[1];
                 Integer v = labels.get((String) f[2]);
                 if (v == null) throw new IllegalStateException("label " + f[2]);
+                if (f.length > 3) v += (Integer) f[3];
                 if (f[0].equals("abs")) {
                     buf[at] = (byte) (v & 0xFF);
                     buf[at + 1] = (byte) (v >> 8);
@@ -353,27 +500,55 @@ public final class RomBuilder {
         }
     }
 
-    static byte[] assemble(int prgBanks, int n, boolean nop, int endBank, int endPage,
-                           String artist, String title) {
-        // font in CHR format: plane 0 only, glyph shifted to columns 1..5
-        int tiles = CHARSET.length();
-        int chrPages = (tiles * 16 + 255) / 256;
-        byte[] chr = new byte[chrPages * 256];
-        for (int t = 0; t < tiles; t++)
-            for (int r = 0; r < 7; r++) chr[t * 16 + r] = (byte) (GLYPHS[t][r] << 2);
+    static byte[] assemble(int prgBanks, int n, boolean nop, Ops ops, int endBank, int endPage,
+                           String artist, String title, String total) {
+        for (int pad = 0; pad < 256; pad++) {
+            Asm a = assemble(prgBanks, n, nop, ops, endBank, endPage, artist, title, total, pad);
+            if (a.crossesPage("loop_full", "pause")) continue;
+            byte[] fixed = Arrays.copyOf(a.buf, 0x4000);
+            int irq = a.labels.get("irq"), reset = a.labels.get("reset");
+            int[] vec = {irq, reset, irq};
+            for (int i = 0; i < 3; i++) {
+                fixed[0x3FFA + 2 * i] = (byte) (vec[i] & 0xFF);
+                fixed[0x3FFB + 2 * i] = (byte) (vec[i] >> 8);
+            }
+            return fixed;
+        }
+        throw new IllegalStateException("could not place the playback loop");
+    }
+
+    static Asm assemble(int prgBanks, int n, boolean nop, Ops ops, int endBank, int endPage,
+                        String artist, String title, String total, int pad) {
+        byte[] chr = chrData();
+        int chrPages = chr.length / 256;
+        int k = ops.k;
+        if ((barAddr() & 0xFF) + BAR_CELLS + 1 > 0xFF) throw new IllegalStateException("bar row");
 
         Asm a = new Asm(0xC000);
         a.label("banktable");
         for (int i = 0; i < prgBanks; i++) a.b(i);
-        while ((a.pc() & 0xFF) != 0) a.b(0);
+        a.page();
         a.label("hitab");
         for (int v = 0; v < 256; v++) a.b(DELTAS[v >> 4] & 0xFF);
         a.label("lotab");
         for (int v = 0; v < 256; v++) a.b(DELTAS[v & 15] & 0xFF);
+        a.label("opreg");
+        for (int i = 0; i < 256; i++) a.b(ops.reg[i]);
+        a.label("opinit");
+        for (int i = 0; i < 256; i++) a.b(ops.val[i]);
+        // startmap[vblank | opidx]: begin the op list on vblank when idle
+        a.label("startmap");
+        for (int i = 0; i < 256; i++) a.b((i & 0x7F) != 0 ? i & 0x7F : (i & 0x80) != 0 ? k : 0);
+        a.label("nextslot");
+        for (int i = 0; i < 256; i++) {
+            int s = i / k;
+            a.b(i % k == 0 && s >= 1 && s < ops.slots ? (s + 1) * k : 0);
+        }
         a.label("font");
         for (byte c : chr) a.b(c);
         int font = a.labels.get("font");
 
+        for (int i = 0; i < pad; i++) a.b(0);
         a.label("reset");
         a.b(0x78, 0xD8);                              // sei, cld
         a.b(0xA2, 0x40); a.w(0x8E, 0x4017);           // no frame IRQ
@@ -393,33 +568,50 @@ public final class RomBuilder {
         a.label("chr"); a.b(0xB1, PTRLO); a.w(0x8D, 0x2007); a.b(0xC8); a.br(0xD0, "chr");
         a.b(0xE6, PTRHI, 0xCA); a.br(0xD0, "chr");
 
-        // palette: black background, white text
+        // palette: black background, white text, green bar fill
         a.b(0xA9, 0x3F); a.w(0x8D, 0x2006); a.b(0xA9, 0x00); a.w(0x8D, 0x2006);
-        for (int i = 0; i < 32; i++) { a.b(0xA9, i % 4 != 0 ? 0x30 : 0x0F); a.w(0x8D, 0x2007); }
+        for (int i = 0; i < 32; i++) {
+            a.b(0xA9, i % 4 == 0 ? 0x0F : i % 4 == 2 ? 0x2A : 0x30); a.w(0x8D, 0x2007);
+        }
 
         // clear nametable 0 + attributes
         a.b(0xA9, 0x20); a.w(0x8D, 0x2006); a.b(0xA9, 0x00); a.w(0x8D, 0x2006);
         a.b(0xA0, 0x04, 0xA2, 0x00);
         a.label("clr"); a.w(0x8D, 0x2007); a.b(0xCA); a.br(0xD0, "clr"); a.b(0x88); a.br(0xD0, "clr");
 
-        // text: artist, blank row, title, centred around row 12; hint at row 20
+        // copy the op values to RAM
+        a.b(0xA2, 0x00);
+        a.label("opcp"); a.w(0xBD, "opinit"); a.w(0x9D, OPVAL); a.b(0xE8); a.br(0xD0, "opcp");
+
+        // text: artist, blank row, title, centred around row 11; hint, timer, bar below
         List<String> lines = new ArrayList<>(wrap(artist));
         List<String> t = wrap(title);
         if (!lines.isEmpty() && !t.isEmpty()) lines.add("");
         lines.addAll(t);
-        int row0 = 12 - lines.size() / 2;
-        List<int[]> placed = new ArrayList<>();
-        List<String> texts = new ArrayList<>();
+        int row0 = 11 - lines.size() / 2;
+        List<int[]> at = new ArrayList<>();
+        List<int[]> tiles = new ArrayList<>();
         for (int i = 0; i < lines.size(); i++) {
-            if (lines.get(i).isEmpty()) continue;
-            placed.add(new int[]{row0 + i}); texts.add(lines.get(i));
+            String s = lines.get(i);
+            if (s.isEmpty()) continue;
+            at.add(new int[]{0x2000 + (row0 + i) * 32 + (32 - s.length()) / 2});
+            tiles.add(tilesOf(s));
         }
-        placed.add(new int[]{20}); texts.add("A: PLAY/PAUSE");
-        for (int i = 0; i < texts.size(); i++) {
-            String s = texts.get(i);
-            int addr = 0x2000 + placed.get(i)[0] * 32 + (32 - s.length()) / 2;
+        String hint = "A: PLAY/PAUSE";
+        at.add(new int[]{0x2000 + 18 * 32 + (32 - hint.length()) / 2});
+        tiles.add(tilesOf(hint));
+        at.add(new int[]{timerAddr()});
+        tiles.add(tilesOf(clock(0) + " / " + total));
+        int[] bar = new int[BAR_CELLS + 2];
+        Arrays.fill(bar, T_EMPTY);
+        bar[0] = T_LCAP;
+        bar[BAR_CELLS + 1] = T_RCAP;
+        at.add(new int[]{barAddr()});
+        tiles.add(bar);
+        for (int i = 0; i < at.size(); i++) {
+            int addr = at.get(i)[0];
             a.b(0xA9, addr >> 8); a.w(0x8D, 0x2006); a.b(0xA9, addr & 0xFF); a.w(0x8D, 0x2006);
-            for (char ch : s.toCharArray()) { a.b(0xA9, CHARSET.indexOf(ch)); a.w(0x8D, 0x2007); }
+            for (int v : tiles.get(i)) { a.b(0xA9, v); a.w(0x8D, 0x2007); }
         }
 
         a.label("vw2"); a.w(0x2C, 0x2002); a.br(0x10, "vw2");
@@ -428,17 +620,21 @@ public final class RomBuilder {
         a.w(0x20, "rewind");
         a.b(0xA9, 0x00, 0x85, PREV);
 
-        // ---- playback loop: 5N+29(+2) cycles per sample, also on page change
+        // ---- playback loop: C = 5N+61+15K(+2) cycles per sample, page changes included
         a.label("loop_full"); a.b(0xA2, n);
         a.label("loop_dx"); a.label("dl"); a.b(0xCA); a.br(0xD0, "dl");
         if (nop) a.b(0xEA);
         decodeSample(a, "hitab");
-        a.b(0xA2, n + 1);
+        work(a, k);
+        a.b(0xA2, n + 1, 0xEA);                       // ldx #N+1 ; nop
         a.label("dl2"); a.b(0xCA); a.br(0xD0, "dl2");
         if (nop) a.b(0xEA);
         decodeSample(a, "lotab");
-        a.b(0xC8); a.br(0xD0, "loop_full");           // iny ; bne
-        a.b(0xE6, PTRHI, 0xA5, PTRHI, 0xC9, 0xC0); a.br(0xD0, "nobank");
+        work(a, k);
+        a.b(0xC8); a.br(0xF0, "pagestep");            // iny ; beq
+        a.w(0x4C, "loop_full");
+        a.label("pagestep");
+        a.b(0xE6, PTRHI, 0xA5, PTRHI, 0xC9, 0x80 + PAGES_PER_BANK); a.br(0xD0, "nobank");
         a.b(0xA9, 0x80, 0x85, PTRHI, 0xE6, BANK, 0xA6, BANK);
         a.w(0xBD, "banktable"); a.w(0x9D, "banktable"); // bus-conflict-safe bank switch
         a.label("nobank");
@@ -446,42 +642,82 @@ public final class RomBuilder {
         a.b(0xA5, PTRHI, 0xC9, endPage); a.br(0xD0, "noend");
         a.w(0x20, "rewind"); a.w(0x4C, "pause");      // song over: rewind and pause
         a.label("noend");
+        copyDisplay(a, ops);
         // inline A-button poll (kept inline so the cycle count stays fixed)
         a.b(0xA9, 0x01); a.w(0x8D, 0x4016); a.b(0xA9, 0x00); a.w(0x8D, 0x4016);
         a.w(0xAD, 0x4016); a.b(0x29, 0x01, 0xAA, 0x45, PREV); a.br(0xF0, "nochg");
         a.b(0x86, PREV, 0x8A); a.br(0xD0, "pause");
-        a.label("nochg"); a.b(0xA2, n - 10); a.w(0x4C, "loop_dx");
+        a.label("nochg"); a.b(0xEA, 0xEA, 0xA2, n - 23); a.w(0x4C, "loop_dx");
 
         // ---- paused: poll once per frame, resume on a fresh press of A
         a.label("pause");
         a.label("pv"); a.w(0x2C, 0x2002); a.br(0x10, "pv");
+        a.b(0xA9, 0x00); a.w(0x8D, 0x2000); a.w(0x8D, 0x2005); a.w(0x8D, 0x2005);
         a.b(0xA9, 0x01); a.w(0x8D, 0x4016); a.b(0xA9, 0x00); a.w(0x8D, 0x4016);
         a.w(0xAD, 0x4016); a.b(0x29, 0x01, 0xAA, 0x45, PREV); a.br(0xF0, "pause");
         a.b(0x86, PREV, 0x8A); a.br(0xF0, "pause");
+        a.b(0xA9, 0x00, 0x85, OPIDX);                 // never resume mid-update
         a.w(0x4C, "loop_full");
 
+        // ---- back to the start: reset state and redraw the bar and timer in vblank
         a.label("rewind");
-        a.b(0xA9, 0x00, 0x85, PTRLO, 0x85, BANK, 0xAA); a.w(0x9D, "banktable");
+        a.b(0xA9, 0x00, 0x85, PTRLO, 0x85, BANK, 0x85, OPIDX, 0xAA); a.w(0x9D, "banktable");
         a.b(0xA9, ACC0, 0x85, ACC);
-        a.b(0xA9, 0x80, 0x85, PTRHI, 0xA0, 0x00, 0x60);
+        a.b(0xA9, 0x80, 0x85, PTRHI);
+        copyDisplay(a, ops);
+        a.label("rwv"); a.w(0x2C, 0x2002); a.br(0x10, "rwv");
+        int ba = barAddr(), ta = timerAddr();
+        a.b(0xA9, ba >> 8); a.w(0x8D, 0x2006); a.b(0xA9, ba & 0xFF); a.w(0x8D, 0x2006);
+        a.b(0xA9, T_LCAP); a.w(0x8D, 0x2007);
+        a.b(0xA9, T_EMPTY, 0xA2, BAR_CELLS);
+        a.label("rwb"); a.w(0x8D, 0x2007); a.b(0xCA); a.br(0xD0, "rwb");
+        a.b(0xA9, T_RCAP); a.w(0x8D, 0x2007);
+        a.b(0xA9, ta >> 8); a.w(0x8D, 0x2006); a.b(0xA9, ta & 0xFF); a.w(0x8D, 0x2006);
+        for (int v : tilesOf(clock(0))) { a.b(0xA9, v); a.w(0x8D, 0x2007); }
+        a.b(0xA9, 0x00); a.w(0x8D, 0x2000); a.w(0x8D, 0x2005); a.w(0x8D, 0x2005);
+        a.b(0xA0, 0x00, 0x60);
 
         a.label("irq"); a.b(0x40);
         a.resolve();
         if (a.len > 0x4000 - 6) throw new IllegalStateException("fixed bank overflow");
-
-        byte[] fixed = Arrays.copyOf(a.buf, 0x4000);
-        int irq = a.labels.get("irq"), reset = a.labels.get("reset");
-        int[] vec = {irq, reset, irq};
-        for (int i = 0; i < 3; i++) {
-            fixed[0x3FFA + 2 * i] = (byte) (vec[i] & 0xFF);
-            fixed[0x3FFB + 2 * i] = (byte) (vec[i] >> 8);
-        }
-        return fixed;
+        return a;
     }
 
-    // lda (ptr),y ; tax ; lda acc ; clc ; adc tab,x ; sta acc ; sta $4011
+    static int[] tilesOf(String s) {
+        int[] v = new int[s.length()];
+        for (int i = 0; i < v.length; i++) v[i] = tile(s.charAt(i));
+        return v;
+    }
+
+    // lda (ptr),y ; tax ; lda acc ; clc ; adc tab,x ; sta acc ; sta $4011   (23 cycles)
     static void decodeSample(Asm a, String tab) {
         a.b(0xB1, PTRLO, 0xAA, 0xA5, ACC, 0x18); a.w(0x7D, tab);
         a.b(0x85, ACC); a.w(0x8D, 0x4011);
+    }
+
+    /**
+     * Fixed-length per-slot work (30 + 15K cycles): poll vblank, start the op
+     * list if idle, then perform this slot's K PPU writes. Tables are
+     * page-aligned so no indexed read crosses a page.
+     */
+    static void work(Asm a, int k) {
+        a.b(0x84, YSAVE);                              // sty ysave
+        a.w(0xAD, 0x2002); a.b(0x29, 0x80, 0x05, OPIDX, 0xAA); // vblank | opidx
+        a.w(0xBD, "startmap"); a.b(0xAA);
+        for (int j = 0; j < k; j++) {
+            a.w(0xBD, "opreg", j); a.b(0xA8);          // lda opreg+j,x ; tay
+            a.w(0xBD, OPVAL + j);                      // lda opval+j,x
+            a.w(0x99, 0x2000);                         // sta $2000,y
+        }
+        a.w(0xBD, "nextslot"); a.b(0x85, OPIDX, 0xA4, YSAVE);
+    }
+
+    /** Copies this page's timer digits and bar head into the op values (63 cycles). */
+    static void copyDisplay(Asm a, Ops ops) {
+        a.b(0xA5, PTRHI, 0x29, 0x3F, 0xAA);
+        for (int t = 0; t < 7; t++) {
+            a.w(0xBD, TABLES + 64 * t);
+            a.w(0x8D, OPVAL + ops.pos[t]);
+        }
     }
 }

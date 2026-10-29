@@ -26,7 +26,6 @@ import java.io.OutputStream;
 
 public class MainActivity extends Activity {
     private static final int REQ_OPEN = 1, REQ_SAVE = 2;
-    private static final int PRG_KB = 512;
 
     private Uri source;
     private String baseName = "song";
@@ -35,7 +34,7 @@ public class MainActivity extends Activity {
 
     private TextView fileLabel, status;
     private EditText artistField, titleField;
-    private Button pickButton, convertButton, saveButton;
+    private Button pickButton, convert512, convert1024, saveButton;
     private ProgressBar bar;
 
     @Override
@@ -49,10 +48,12 @@ public class MainActivity extends Activity {
         TextView heading = text("Music → NES ROM", 24);
         heading.setTypeface(Typeface.DEFAULT_BOLD);
         col.addView(heading);
-        col.addView(text("Turns a song into a " + PRG_KB + " KB NES ROM (mapper 2). The title shows on "
-                + "screen and A plays/pauses. Songs up to about "
-                + Math.round(RomBuilder.maxSeconds(PRG_KB) / 60) + " minutes fit; longer songs get a "
-                + "lower sample rate.", 14));
+        col.addView(text("Turns a song into an NES ROM (mapper 2) with the title, a timer and a "
+                + "progress bar on screen; A plays/pauses. For songs over about 2 minutes, a 1 MB "
+                + "ROM gets twice the sample rate of a 512 KB one. Up to about "
+                + Math.round(RomBuilder.maxSeconds(512) / 60)
+                + " minutes fit in 512 KB and " + Math.round(RomBuilder.maxSeconds(1024) / 60)
+                + " in 1 MB; longer songs get a lower sample rate.", 14));
 
         pickButton = button("Choose audio file", v -> pick());
         col.addView(pickButton);
@@ -66,9 +67,11 @@ public class MainActivity extends Activity {
         titleField = field();
         col.addView(titleField);
 
-        convertButton = button("Convert to " + PRG_KB + " KB ROM", v -> convert());
-        convertButton.setEnabled(false);
-        col.addView(convertButton);
+        convert512 = button("Convert to 512 KB ROM", v -> convert(512));
+        convert1024 = button("Convert to 1 MB ROM", v -> convert(1024));
+        setConvertEnabled(false);
+        col.addView(convert512);
+        col.addView(convert1024);
 
         bar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         bar.setMax(1000);
@@ -116,7 +119,7 @@ public class MainActivity extends Activity {
             rom = null;
             saveButton.setVisibility(View.GONE);
             fillFromFile(source);
-            convertButton.setEnabled(!busy);
+            setConvertEnabled(!busy);
             status.setText("");
         } else if (req == REQ_SAVE) {
             try (OutputStream os = getContentResolver().openOutputStream(data.getData(), "wt")) {
@@ -164,12 +167,17 @@ public class MainActivity extends Activity {
         titleField.setText(RomBuilder.sanitize(title));
     }
 
-    private void convert() {
+    private void setConvertEnabled(boolean on) {
+        convert512.setEnabled(on);
+        convert1024.setEnabled(on);
+    }
+
+    private void convert(final int prgKb) {
         if (source == null || busy) return;
         busy = true;
         rom = null;
         pickButton.setEnabled(false);
-        convertButton.setEnabled(false);
+        setConvertEnabled(false);
         saveButton.setVisibility(View.GONE);
         bar.setProgress(0);
         bar.setVisibility(View.VISIBLE);
@@ -180,7 +188,7 @@ public class MainActivity extends Activity {
             try {
                 AudioDecoder.Pcm pcm = AudioDecoder.decode(this, uri, (s, f) -> progress(s, f * 0.3f));
                 RomBuilder.Result r = RomBuilder.build(pcm.samples, pcm.length, pcm.rate, artist, title,
-                        PRG_KB, (s, f) -> progress(s, s.equals("Encoding") ? 0.45f + f * 0.55f
+                        prgKb, (s, f) -> progress(s, s.equals("Encoding") ? 0.45f + f * 0.55f
                                 : 0.3f + f * 0.15f));
                 runOnUiThread(() -> {
                     rom = r.rom;
@@ -205,7 +213,7 @@ public class MainActivity extends Activity {
         busy = false;
         bar.setVisibility(View.INVISIBLE);
         pickButton.setEnabled(true);
-        convertButton.setEnabled(source != null);
+        setConvertEnabled(source != null);
     }
 
     private long lastUi;
